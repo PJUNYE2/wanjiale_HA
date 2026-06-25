@@ -1,7 +1,9 @@
 {
   "name": "Wanjiale Control",
   "render_readme": true,
-  "homeassistant": "2026.1.0",
-  "country": ["CN"],
+  "homeassistant": "2025.7.1",
+  "country": [
+    "CN"
+  ],
   "zip_release": false
 }
