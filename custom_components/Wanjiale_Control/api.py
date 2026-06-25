@@ -134,16 +134,41 @@ class WanjialeDevice:
         return self._send_cloud_control(as_dict)
 
     def _send_cloud_control(self, as_dict: Dict[str, Any]) -> Dict[str, Any]:
-        if not getattr(self._protocol, "_socket", None):
+        def _connect_or_relogin() -> bool:
+            if getattr(self._protocol, "_socket", None):
+                return True
             try:
-                self._protocol.connect_server()
+                return bool(self._protocol.connect_server())
             except Exception:
-                _LOGGER.debug("建立长连接失败, 云控制不可用")
-                return {"error": "cloud unavailable"}
+                _LOGGER.debug("建立长连接失败，尝试重新登录", exc_info=True)
+            try:
+                self._protocol.close_server()
+                self._protocol.login()
+                return bool(self._protocol.connect_server())
+            except Exception:
+                _LOGGER.debug("重新登录/建立长连接失败", exc_info=True)
+                return False
+
+        if not _connect_or_relogin():
+            return {"error": "cloud unavailable"}
+
         try:
+            result = self._protocol.send_control_async(self.did, as_dict)
+            if isinstance(result, dict) and not result.get("error"):
+                return result
+        except Exception:
+            _LOGGER.debug("send_control_async 失败，准备重连重试", exc_info=True)
+
+        try:
+            self._protocol.close_server()
+        except Exception:
+            pass
+        try:
+            self._protocol.login()
+            self._protocol.connect_server()
             return self._protocol.send_control_async(self.did, as_dict)
         except Exception:
-            _LOGGER.debug("send_control_async 失败")
+            _LOGGER.debug("send_control_async 重试失败", exc_info=True)
             return {"error": "send failed"}
 
     def _send_lan_control(self, as_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -384,6 +409,35 @@ class WanjialeApi:
                     dev.name, dev.local_host, dev.local_port,
                 )
 
+    def _ensure_cloud_connected(self) -> bool:
+        """确保云端长连接可用；失败时尝试重新登录后再连接。"""
+        if getattr(self._protocol, "_socket", None):
+            return True
+        try:
+            return bool(self._protocol.connect_server())
+        except Exception:
+            _LOGGER.debug("云端长连接不可用，尝试重新登录", exc_info=True)
+        try:
+            self._protocol.close_server()
+            self._protocol.login()
+            return bool(self._protocol.connect_server())
+        except Exception:
+            _LOGGER.debug("重新登录/重建长连接失败", exc_info=True)
+            return False
+
+    def _relogin_and_reconnect_cloud(self) -> bool:
+        """强制重新登录并重建云端长连接。"""
+        try:
+            self._protocol.close_server()
+        except Exception:
+            pass
+        try:
+            self._protocol.login()
+            return bool(self._protocol.connect_server())
+        except Exception:
+            _LOGGER.debug("强制重新登录/重连失败", exc_info=True)
+            return False
+
     # ------------------------------------------------------------------
     # 核心：通过 TCP 长连接查询设备状态
     # ------------------------------------------------------------------
@@ -482,10 +536,23 @@ class WanjialeApi:
             return {"error": "lan query failed"}
 
     def _query_device_cloud(self, dev: WanjialeDevice) -> Dict[str, Any]:
-        """通过云端长连接查询设备状态。"""
-        if not getattr(self._protocol, "_socket", None):
+        """通过云端长连接查询设备状态；长连接失效时自动重连/重新登录。"""
+        if not self._ensure_cloud_connected():
             return {"error": "no cloud socket"}
-        return self._protocol.query_device(dev.did, timeout=3)
+        try:
+            result = self._protocol.query_device(dev.did, timeout=3)
+            if isinstance(result, dict) and not result.get("error"):
+                return result
+        except Exception:
+            _LOGGER.debug("云端查询失败，准备重新登录后重试", exc_info=True)
+
+        if not self._relogin_and_reconnect_cloud():
+            return {"error": "cloud reconnect failed"}
+        try:
+            return self._protocol.query_device(dev.did, timeout=3)
+        except Exception:
+            _LOGGER.debug("云端查询重试失败", exc_info=True)
+            return {"error": "cloud query failed"}
 
     async def async_refresh_all(self) -> None:
         """异步刷新（HA coordinator 调用）。"""
